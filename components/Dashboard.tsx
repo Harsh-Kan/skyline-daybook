@@ -1,16 +1,18 @@
 
 import React, { useState, useMemo } from 'react';
 import { Transaction, BankConfig } from '../types';
+import { isCashAccount } from '../bankAccounts';
 import { formatCurrency } from '../utils/formatters';
 import { CreditCard, Wallet, TrendingUp, TrendingDown, Calendar, Calculator } from 'lucide-react';
 
 interface DashboardProps {
+  companyName?: string;
   transactions: Transaction[];
   bankConfigs: BankConfig[];
   onNavigateLedger: (id: string) => void;
 }
 
-export const Dashboard: React.FC<DashboardProps> = ({ transactions, bankConfigs, onNavigateLedger }) => {
+export const Dashboard: React.FC<DashboardProps> = ({ companyName, transactions, bankConfigs, onNavigateLedger }) => {
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
 
@@ -49,11 +51,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ transactions, bankConfigs,
     return txs.reduce((acc, curr) => acc + curr.paymentIn - curr.paymentOut, 0);
   };
 
+  const unmatchedAccountIds = [...new Set(transactions.map(tx => tx.accountId))]
+    .filter(id => !bankConfigs.some(bank => bank.id === id));
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold text-gray-900">Skyline Globle Summary</h2>
+          <h2 className="break-words text-xl font-bold text-gray-900">{companyName || 'My Company'} Summary</h2>
           <p className="text-xs text-gray-500 italic">Real-time overview of connected accounts</p>
         </div>
         
@@ -127,7 +132,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ transactions, bankConfigs,
           <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2 px-1 uppercase tracking-wider">
             <CreditCard className="text-violet-500" size={16} /> Account Breakdown
           </h3>
+          {unmatchedAccountIds.length > 0 && <div role="alert" className="text-sm text-amber-800 bg-amber-50 p-3 rounded-lg">
+            Some historical transactions reference accounts that are not in the company bank list. Their original references and summary totals are preserved. Confirm the account mapping before migrating them.
+            {unmatchedAccountIds.map(id => <button key={id} className="block underline" onClick={() => onNavigateLedger(id)}>
+              Historical account {id}: {formatCurrency(getAccountBalance(id))}
+            </button>)}
+          </div>}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {bankConfigs.length === 0 && <p>No bank accounts are visible for this company. Check company ownership and SELECT permissions if you expect existing accounts.</p>}
             {bankConfigs.map((bank) => {
               const balance = getAccountBalance(bank.id);
               return (
@@ -137,8 +149,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ transactions, bankConfigs,
                   className="bg-white p-5 rounded-xl border border-gray-100 shadow-sm hover:shadow-md transition-shadow cursor-pointer group flex items-center justify-between"
                 >
                   <div className="flex items-center gap-3">
-                    <div className={`p-2 rounded-lg ${bank.id === 'cash' ? 'bg-amber-100 text-amber-600' : 'bg-violet-100 text-violet-600'}`}>
-                      {bank.id === 'cash' ? <Wallet size={18} /> : <CreditCard size={18} />}
+                    <div className={`p-2 rounded-lg ${isCashAccount(bank) ? 'bg-amber-100 text-amber-600' : 'bg-violet-100 text-violet-600'}`}>
+                      {isCashAccount(bank) ? <Wallet size={18} /> : <CreditCard size={18} />}
                     </div>
                     <div>
                       <h3 className="text-gray-400 text-xs font-bold uppercase truncate max-w-[150px]">{bank.name}</h3>

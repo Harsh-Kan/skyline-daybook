@@ -15,7 +15,11 @@
     "react-dom": "^19.2.4"
   },
   "devDependencies": {
+    "@locator/babel-jsx": "^2.0.0",
+    "@locator/runtime": "^2.0.0",
     "@types/node": "^22.19.11",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.4",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"

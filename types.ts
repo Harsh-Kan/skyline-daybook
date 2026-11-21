@@ -6,24 +6,50 @@ export enum TransactionType {
 
 export interface Transaction {
   id: string;
-  accountId: string; // bank1, bank2, bank3, bank4, cash
+
+  companyId?: string;
+
+  createdBy?: string;
+
+  accountId: string;
+
   date: string;
+
   particulars: string;
+
   type: TransactionType;
+
   paymentIn: number;
+
   paymentOut: number;
+
   runningBalance: number;
+
   createdAt: number;
 }
 
 export interface BankConfig {
   id: string;
+  companyId?: string;
   name: string;
+  position?: number;
+  isCash?: boolean;
 }
 
 export interface User {
-  username: string;
-  password?: string;
+  id?: string;
+  email?: string;
+  fullName?: string;
+
+  companyName?: string;
+
+  companyId?: string;
+
+  role:
+    | 'SUPER_ADMIN'
+    | 'ADMIN'
+    | 'EXECUTIVE';
+
   isAdmin: boolean;
 }
 

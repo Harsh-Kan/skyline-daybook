@@ -1,35 +1,73 @@
 
-import React, { useState, useEffect } from 'react';
-import { User, BankConfig } from '../types';
-import { ShieldAlert, Save, RefreshCw, Lock, Plus, Trash2, ArrowUp, ArrowDown, MoveVertical, Users, UserMinus, UserCheck, Eye, EyeOff, Hash } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { User, BankConfig, Transaction } from '../types';
+import { isCashAccount, cashFirst, errorMessage } from '../bankAccounts';
+import { supabase } from '../supabase';
+import { Subscription, PLAN_LIMITS, formatLimit } from '../subscriptions';
+import { CompanyProfile } from './CompanyProfile';
+import { ShieldAlert, Save, RefreshCw, Lock, Plus, ArrowUp, ArrowDown, MoveVertical, Users, Pencil, Trash2 } from 'lucide-react';
+
+const transactionDeleteWarning = 'Cannot delete: this bank has transactions, even if its balance is zero.';
 
 interface SettingsProps {
   user: User;
   bankConfigs: BankConfig[];
-  onSave: (configs: BankConfig[]) => void;
+  onSave: (configs: BankConfig[]) => Promise<void>;
+  onAdd: () => Promise<void>;
+  onDelete: (bankId: string) => Promise<void>;
+  onRenameCompany: (name: string) => Promise<string>;
+  transactions: Transaction[];
+  isSaving: boolean;
+  companyPlan: string | null;
+  subscription: Subscription | null;
+  subscriptionLoading: boolean;
+  subscriptionError: string | null;
 }
 
-export const Settings: React.FC<SettingsProps> = ({ user, bankConfigs, onSave }) => {
-  const [configs, setConfigs] = useState<BankConfig[]>(bankConfigs);
+export const Settings: React.FC<SettingsProps> = ({ user, bankConfigs, onSave, onAdd, onDelete, onRenameCompany, transactions, isSaving, companyPlan, subscription, subscriptionLoading, subscriptionError }) => {
+  const [configs, setConfigs] = useState<BankConfig[]>(() => cashFirst(bankConfigs));
   const [isSaved, setIsSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [hasChanges, setHasChanges] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<BankConfig | null>(null);
+  const [deletedMessage, setDeletedMessage] = useState<string | null>(null);
+  const [blockedDeleteBankId, setBlockedDeleteBankId] = useState<string | null>(null);
+  const nameInputs = useRef<Record<string, HTMLInputElement | null>>({});
+  const deleteDialog = useRef<HTMLDialogElement | null>(null);
+  useEffect(() => {
+    if (!deleteTarget || !deleteDialog.current) return;
+    const dialog = deleteDialog.current;
+    const previousFocus = document.activeElement;
+    const previousOverflow = document.body.style.overflow;
+    dialog.showModal();
+    document.body.style.overflow = 'hidden';
+    return () => {
+      dialog.close();
+      document.body.style.overflow = previousOverflow;
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
+    };
+  }, [deleteTarget]);
+  useEffect(() => { setConfigs(cashFirst(bankConfigs)); setHasChanges(false); }, [bankConfigs]);
   const [isReorderMode, setIsReorderMode] = useState(false);
   
-  // User Management State
-  const [allUsers, setAllUsers] = useState<User[]>([]);
-  const [isSignupEnabled, setIsSignupEnabled] = useState<boolean>(true);
-  const [maxUsers, setMaxUsers] = useState<number>(4);
-  const [visiblePasswords, setVisiblePasswords] = useState<Record<string, boolean>>({});
-
+  const [members, setMembers] = useState<{ user_id: string; role: string }[]>([]);
+  const [membersLoading, setMembersLoading] = useState(true);
+  const [membersError, setMembersError] = useState<string | null>(null);
+  const maxBanks = subscription?.bankLimit ?? null;
+  const banksWithTransactions = new Set(transactions.map(transaction => transaction.accountId));
   useEffect(() => {
-    const savedUsers = JSON.parse(localStorage.getItem('skyline_all_users') || '[]');
-    setAllUsers(savedUsers);
-    
-    const signupStatus = localStorage.getItem('skyline_signup_enabled') !== 'false';
-    setIsSignupEnabled(signupStatus);
-
-    const savedLimit = localStorage.getItem('skyline_max_users');
-    if (savedLimit) setMaxUsers(Number(savedLimit));
-  }, []);
+    let cancelled = false;
+    setMembers([]); setMembersError(null); setMembersLoading(true);
+    if (!user.companyId) { setMembersLoading(false); return; }
+    supabase.from('company_users').select('user_id, role').eq('company_id', user.companyId)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) setMembersError(error.message);
+        else setMembers(data ?? []);
+        setMembersLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [user.companyId]);
 
   if (!user.isAdmin) {
   return (
@@ -44,61 +82,68 @@ export const Settings: React.FC<SettingsProps> = ({ user, bankConfigs, onSave })
 }
 
   const handleNameChange = (id: string, newName: string) => {
+    setIsSaved(false); setHasChanges(true);
     setConfigs(prev => prev.map(c => c.id === id ? { ...c, name: newName } : c));
   };
 
-  const addBankAccount = () => {
-    const newId = `bank_${Date.now()}`;
-    setConfigs(prev => [...prev, { id: newId, name: 'New Bank Account' }]);
+  const addBankAccount = async () => {
+    setSaveError(null); setIsSaved(false);
+    try {
+      // Persist the current draft before the insert refreshes shared records.
+      if (hasChanges) await onSave(configs);
+      await onAdd();
+      setIsSaved(true);
+    }
+    catch (error) { setSaveError(errorMessage(error)); }
   };
 
-  const removeBankAccount = (id: string) => {
-    if (id === 'cash') return;
-    setConfigs(prev => prev.filter(c => c.id !== id));
-  };
+  const bankCount = bankConfigs.filter(bank => !isCashAccount(bank)).length;
+  const addDisabledReason = isSaving
+    ? 'Please wait while bank accounts are being saved.'
+    : subscriptionLoading ? 'Loading your company subscription...'
+    : subscriptionError ? subscriptionError
+    : subscription?.trialExpired ? 'Your 14-day Trial has ended. Choose a subscription plan to add banks. Existing accounts and Cash remain available.'
+    : maxBanks === null || (maxBanks !== Infinity && (!Number.isInteger(maxBanks) || maxBanks < 0))
+      ? 'Your subscription bank limit is unavailable. Reload the page or contact your administrator.'
+      : bankCount >= maxBanks
+        ? `Your subscription allows ${maxBanks} bank account${maxBanks === 1 ? '' : 's'}, and ${bankCount} already exist. Your subscription limit must increase before adding another bank. Cash Account is free.`
+        : null;
 
   const moveAccount = (index: number, direction: 'up' | 'down') => {
     const newConfigs = [...configs];
     const targetIndex = direction === 'up' ? index - 1 : index + 1;
     
     if (targetIndex < 0 || targetIndex >= newConfigs.length) return;
+    if (isCashAccount(newConfigs[index]) || isCashAccount(newConfigs[targetIndex])) return;
     
     const [movedItem] = newConfigs.splice(index, 1);
     newConfigs.splice(targetIndex, 0, movedItem);
+    setIsSaved(false); setHasChanges(true);
     setConfigs(newConfigs);
   };
 
-  const handleDeleteUser = (usernameToDelete: string) => {
-    if (usernameToDelete === 'Harsh') return;
-    const updatedUsers = allUsers.filter(u => u.username !== usernameToDelete);
-    setAllUsers(updatedUsers);
-    localStorage.setItem('skyline_all_users', JSON.stringify(updatedUsers));
-  };
-
-  const toggleSignupAuthority = () => {
-    const newState = !isSignupEnabled;
-    setIsSignupEnabled(newState);
-    localStorage.setItem('skyline_signup_enabled', String(newState));
-  };
-
-  const handleLimitChange = (val: string) => {
-    const num = parseInt(val) || 1;
-    setMaxUsers(num);
-    localStorage.setItem('skyline_max_users', String(num));
-  };
-
-  const togglePasswordVisibility = (username: string) => {
-    setVisiblePasswords(prev => ({
-      ...prev,
-      [username]: !prev[username]
-    }));
-  };
-
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    onSave(configs);
-    setIsSaved(true);
-    setTimeout(() => setIsSaved(false), 3000);
+    setSaveError(null); setIsSaved(false);
+    try { await onSave(configs); setIsSaved(true); }
+    catch (error) { setSaveError(errorMessage(error)); }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || isCashAccount(deleteTarget) || isSaving) return;
+    setSaveError(null); setIsSaved(false); setDeletedMessage(null); setBlockedDeleteBankId(null);
+    try {
+      if (banksWithTransactions.has(deleteTarget.id))
+        throw new Error(transactionDeleteWarning);
+      if (hasChanges) await onSave(configs);
+      await onDelete(deleteTarget.id);
+      setDeletedMessage(`${deleteTarget.name} deleted.`);
+    } catch (error) {
+      const message = errorMessage(error);
+      if (message.includes('has transactions')) setBlockedDeleteBankId(deleteTarget.id);
+      else setSaveError(message);
+    }
+    finally { setDeleteTarget(null); }
   };
 
   return (
@@ -106,7 +151,6 @@ export const Settings: React.FC<SettingsProps> = ({ user, bankConfigs, onSave })
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold text-gray-900">System Configuration</h2>
-          <p className="text-gray-500 text-sm">Manage bank accounts, ordering, and user access (Admin: Harsh)</p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2 bg-violet-50 px-3 py-2 rounded-lg border border-violet-100">
@@ -120,14 +164,32 @@ export const Settings: React.FC<SettingsProps> = ({ user, bankConfigs, onSave })
           </div>
           
           <button 
-            onClick={addBankAccount}
-            className="flex items-center gap-2 bg-violet-600 text-white px-4 py-2 rounded-lg hover:bg-violet-700 transition-colors font-bold text-xs uppercase"
+            onClick={() => addBankAccount()}
+            disabled={Boolean(addDisabledReason)}
+            title={addDisabledReason ?? (hasChanges ? 'Save pending changes and add a bank' : 'Add a bank account')}
+            className="flex items-center gap-2 bg-violet-600 text-white px-4 py-2 rounded-lg hover:bg-violet-700 transition-colors font-bold text-xs uppercase disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Plus size={16} /> Add New Bank
           </button>
         </div>
       </div>
 
+      {saveError && <p role="alert" className="text-red-700">{saveError}</p>}
+      {deletedMessage && <p role="status" className="text-green-700">{deletedMessage}</p>}
+      {deleteTarget && <dialog ref={deleteDialog} role="dialog" aria-modal="true" aria-labelledby="delete-bank-heading" aria-describedby="delete-bank-description"
+        onCancel={event => { event.preventDefault(); if (!isSaving) setDeleteTarget(null); }}
+        className="m-auto w-[calc(100%-2rem)] max-w-md rounded-2xl border-0 bg-white p-6 shadow-2xl backdrop:bg-black/50">
+        <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-full bg-red-50 text-red-600"><Trash2 size={22} /></div>
+        <h3 id="delete-bank-heading" className="break-words text-lg font-bold text-gray-900">Delete {deleteTarget.name}?</h3>
+        <p id="delete-bank-description" className="mt-2 text-sm text-gray-500">This cannot be undone.</p>
+        <div className="mt-6 flex justify-end gap-3">
+          <button type="button" autoFocus disabled={isSaving} onClick={() => setDeleteTarget(null)} className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-bold text-gray-700 hover:bg-gray-50 disabled:opacity-50">Cancel</button>
+          <button type="button" disabled={isSaving} onClick={confirmDelete} className="rounded-lg bg-red-600 px-4 py-2 text-sm font-bold text-white hover:bg-red-700 disabled:opacity-50">{isSaving ? 'Deleting...' : 'Confirm delete'}</button>
+        </div>
+      </dialog>}
+      {isSaving && <p role="status">Saving bank accounts...</p>}
+      {isSaved && <p role="status" className="text-green-700">Bank accounts saved.</p>}
+      <p className="text-sm text-gray-500">{bankCount} / {maxBanks === null ? 'Unavailable' : formatLimit(maxBanks)} bank accounts</p>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Bank Management Column */}
         <div className="lg:col-span-2 space-y-6">
@@ -138,17 +200,18 @@ export const Settings: React.FC<SettingsProps> = ({ user, bankConfigs, onSave })
                </div>
                {isReorderMode && <span className="text-[10px] text-violet-600 font-bold bg-violet-50 px-2 py-1 rounded">Reorder Mode Active</span>}
             </div>
-            <form onSubmit={handleSubmit} className="p-6 space-y-6">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <form aria-label="Bank account configuration" onSubmit={handleSubmit} className="p-6 space-y-6">
+              <fieldset disabled={isSaving} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {configs.length === 0 && <p>No bank accounts.</p>}
                 {configs.map((config, index) => (
                   <div key={config.id} className="group relative bg-white border border-gray-100 p-3 rounded-xl hover:border-violet-200 transition-all shadow-sm flex items-center gap-3">
-                    {isReorderMode && (
+                    {isReorderMode && !isCashAccount(config) && (
                       <div className="flex flex-col gap-1 pr-2 border-r border-gray-100">
                         <button 
                           type="button"
-                          disabled={index === 0}
+                          disabled={index === 0 || isCashAccount(configs[index - 1])}
                           onClick={() => moveAccount(index, 'up')}
-                          className={`p-1 rounded hover:bg-violet-100 text-gray-400 hover:text-violet-600 transition-colors ${index === 0 ? 'opacity-20 cursor-not-allowed' : ''}`}
+                          className={`p-1 rounded hover:bg-violet-100 text-gray-400 hover:text-violet-600 transition-colors ${index === 0 || isCashAccount(configs[index - 1]) ? 'opacity-20 cursor-not-allowed' : ''}`}
                         >
                           <ArrowUp size={14} />
                         </button>
@@ -163,160 +226,105 @@ export const Settings: React.FC<SettingsProps> = ({ user, bankConfigs, onSave })
                       </div>
                     )}
                     
-                    <div className="flex-1 space-y-1">
-                      <label className="text-[10px] font-bold text-gray-400 flex items-center gap-2 uppercase tracking-tighter">
-                        {config.id === 'cash' ? <Lock size={10} /> : <MoveVertical size={10} className="opacity-40" />}
-                        Ref: {config.id}
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <label className="text-[10px] font-bold text-gray-400 flex items-center gap-2 uppercase tracking-tighter overflow-hidden">
+                        {isCashAccount(config) ? <Lock size={10} /> : <MoveVertical size={10} className="opacity-40" />}
+                        <span className="truncate" title={config.id}>Ref: {config.id}</span>
                       </label>
                       <div className="flex gap-2">
                         <input 
                           type="text"
+                          ref={input => { nameInputs.current[config.id] = input; }}
                           value={config.name}
-                          disabled={config.id === 'cash'}
+                          disabled={isCashAccount(config)}
                           onChange={(e) => handleNameChange(config.id, e.target.value)}
-                          className={`flex-1 p-2 text-sm rounded-lg border outline-none focus:ring-2 focus:ring-violet-500 transition-all ${
-                            config.id === 'cash' ? 'bg-gray-50 text-gray-400 cursor-not-allowed' : 'border-gray-200'
+                          className={`min-w-0 flex-1 p-2 text-sm rounded-lg border outline-none focus:ring-2 focus:ring-violet-500 transition-all ${
+                            isCashAccount(config) ? 'bg-gray-50 text-gray-400 cursor-not-allowed' : 'border-gray-200'
                           }`}
                         />
-                        {config.id !== 'cash' && (
-                          <button 
-                            type="button"
-                            onClick={() => removeBankAccount(config.id)}
-                            className="p-2 text-red-300 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                          >
-                            <Trash2 size={16} />
-                          </button>
+                        {!isCashAccount(config) && (
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button type="button" aria-label={`Edit ${config.name}`} title="Edit bank name"
+                              onClick={() => { nameInputs.current[config.id]?.focus(); nameInputs.current[config.id]?.select(); }}
+                              className="rounded-lg p-2 text-violet-600 hover:bg-violet-50 focus-visible:ring-2 focus-visible:ring-violet-500">
+                              <Pencil size={16} />
+                            </button>
+                              <button type="button" disabled={isSaving} aria-label={`Delete ${config.name}`}
+                                onClick={() => {
+                                  setSaveError(null); setDeletedMessage(null); setDeleteTarget(null); setBlockedDeleteBankId(null);
+                                  if (banksWithTransactions.has(config.id)) {
+                                    setBlockedDeleteBankId(config.id);
+                                    return;
+                                  }
+                                  setDeleteTarget(config);
+                                }}
+                                className="rounded-lg p-2 text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-red-300">
+                                <Trash2 size={16} />
+                              </button>
+                          </div>
                         )}
                       </div>
+                      {blockedDeleteBankId === config.id && (
+                        <p role="alert" className="text-xs text-amber-800">{transactionDeleteWarning}</p>
+                      )}
                     </div>
                   </div>
                 ))}
-              </div>
+              </fieldset>
 
               <div className="pt-6 border-t flex flex-col md:flex-row md:items-center justify-between gap-4">
-                 <p className="text-[10px] text-gray-400 italic font-medium">
-                   * Repositioning affects Dashboard display order.
-                 </p>
                  <button 
                    type="submit"
+                   disabled={isSaving || !hasChanges}
                    className={`flex items-center justify-center space-x-2 px-6 py-2 rounded-lg font-bold transition-all shadow-md text-xs uppercase ${
                      isSaved ? 'bg-green-600 text-white' : 'bg-violet-600 text-white hover:bg-violet-700'
                    }`}
                  >
                    <Save size={16} />
-                   <span>{isSaved ? 'Saved' : 'Apply Layout'}</span>
+                   <span>{isSaving ? 'Saving...' : isSaved ? 'Saved' : 'Apply Layout'}</span>
                  </button>
               </div>
             </form>
           </div>
         </div>
 
-        {/* User Management Column */}
         <div className="space-y-6">
-          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
-            <div className="p-4 border-b bg-gray-50 flex items-center justify-between">
-              <div className="flex items-center gap-2 font-bold text-gray-700 uppercase text-xs tracking-widest">
-                <Users size={14} /> User Control
-              </div>
-            </div>
-            <div className="p-6 space-y-6">
-              {/* Signup Authority Toggle */}
-              <div className="flex items-center justify-between p-4 bg-violet-50 rounded-xl border border-violet-100">
-                <div className="flex flex-col">
-                  <span className="text-xs font-bold text-violet-900 uppercase">Sign-up Authority</span>
-                  <span className="text-[10px] text-violet-600 italic">Toggle registration ability</span>
-                </div>
-                <button 
-                  onClick={toggleSignupAuthority}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${isSignupEnabled ? 'bg-green-500' : 'bg-red-400'}`}
-                >
-                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${isSignupEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
-                </button>
-              </div>
-
-              {/* Registration Limit */}
-              <div className="p-4 bg-gray-50 rounded-xl border border-gray-100 space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-gray-600 uppercase flex items-center gap-2">
-                    <Hash size={12} /> Max Registrations
-                  </label>
-                  <input 
-                    type="number" 
-                    min="1"
-                    value={maxUsers}
-                    onChange={(e) => handleLimitChange(e.target.value)}
-                    className="w-16 p-1 text-sm font-bold text-center border rounded-lg focus:ring-1 focus:ring-violet-500 outline-none"
-                  />
-                </div>
-                <div className="w-full bg-gray-200 rounded-full h-1.5 overflow-hidden">
-                  <div 
-                    className={`h-full transition-all ${allUsers.length >= maxUsers ? 'bg-red-500' : 'bg-violet-500'}`} 
-                    style={{ width: `${Math.min(100, (allUsers.length / maxUsers) * 100)}%` }}
-                  ></div>
-                </div>
-                <p className="text-[10px] text-gray-400 font-medium">{allUsers.length} of {maxUsers} slots used</p>
-              </div>
-
-              {/* Registered Users List */}
-              <div className="space-y-3">
-                <h4 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1">Registered Users</h4>
-                <div className="space-y-2">
-                  {allUsers.map((u) => (
-                    <div key={u.username} className="flex flex-col p-3 bg-white border border-gray-100 rounded-xl hover:shadow-sm transition-all group">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                          <div className={`p-2 rounded-full ${u.username === 'Harsh' ? 'bg-violet-100 text-violet-600' : 'bg-gray-100 text-gray-600'}`}>
-                            {u.username === 'Harsh' ? <ShieldAlert size={14} /> : <Users size={14} />}
-                          </div>
-                          <div className="flex flex-col">
-                            <span className="text-sm font-bold text-gray-800">{u.username}</span>
-                            <span className="text-[10px] text-gray-400 uppercase font-bold tracking-tighter">
-                              {u.username === 'Harsh' ? 'Master Admin' : 'Standard User'}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <button 
-                            onClick={() => togglePasswordVisibility(u.username)}
-                            className="p-1.5 text-gray-400 hover:text-violet-600 rounded-lg hover:bg-violet-50 transition-colors"
-                            title="View Password"
-                          >
-                            {visiblePasswords[u.username] ? <EyeOff size={14} /> : <Eye size={14} />}
-                          </button>
-                          {u.username !== 'Harsh' && (
-                            <button 
-                              onClick={() => handleDeleteUser(u.username)}
-                              className="p-1.5 text-red-300 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
-                              title="Remove User"
-                            >
-                              <UserMinus size={14} />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      
-                      {visiblePasswords[u.username] && (
-                        <div className="mt-2 p-2 bg-violet-50 rounded-lg border border-violet-100 flex items-center justify-between">
-                          <span className="text-[10px] font-bold text-violet-700 uppercase">Access Key:</span>
-                          <span className="text-xs font-mono font-bold text-violet-900">{u.password || 'N/A'}</span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {isSignupEnabled && allUsers.length < maxUsers ? (
-                <div className="flex items-center gap-2 text-green-600 bg-green-50 p-3 rounded-lg border border-green-100 text-[10px] font-bold uppercase justify-center">
-                  <UserCheck size={14} /> New Users Can Join
-                </div>
-              ) : (
-                <div className="flex items-center gap-2 text-red-600 bg-red-50 p-3 rounded-lg border border-red-100 text-[10px] font-bold uppercase justify-center">
-                  <UserMinus size={14} /> Sign-ups are Blocked
-                </div>
-              )}
-            </div>
-          </div>
+          <CompanyProfile companyName={user.companyName ?? ''} onRename={onRenameCompany} />
+          <section className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm space-y-3">
+            <h3 className="font-bold text-gray-800">Company Subscription</h3>
+            {!subscriptionLoading && companyPlan && <p className="font-bold text-violet-700">{companyPlan}</p>}
+            {subscriptionLoading ? <p role="status">Loading subscription...</p> : subscriptionError ? <p role="alert" className="text-red-700">{subscriptionError}</p> : subscription && <>
+              <p>Bank accounts: {formatLimit(subscription.bankLimit)}</p>
+              <p>Users allowed: {subscription.userLimit}</p>
+              <p>Cash Account: 1 included free</p>
+              {subscription.trialEndsAt && <p className={subscription.trialExpired ? 'text-red-700' : 'text-gray-600'}>
+                {subscription.trialExpired ? 'Trial expired' : subscription.trialDaysRemaining + ' days remaining in your 14-day Trial'}
+                {' ? Ends ' + new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' }).format(new Date(subscription.trialEndsAt))}
+              </p>}
+            </>}
+          </section>
+          <section className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm space-y-3">
+            <h3 className="flex items-center gap-2 font-bold text-gray-800"><Users size={16} /> Company Members</h3>
+            {membersLoading ? <p role="status">Loading members...</p> : membersError ? <p role="alert" className="text-red-700">{membersError}</p> : <>
+              <p>{members.length} / {subscription?.userLimit ?? 'Unavailable'} users</p>
+              {members.map((member, index) => <div key={member.user_id} className="flex justify-between border-b py-2 text-sm">
+                <span>{member.user_id === user.id ? (user.email || 'You') : 'Company member ' + (index + 1)}</span>
+                <span className="text-gray-500">{member.role}</span>
+              </div>)}
+            </>}
+          </section>
+          <section className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm space-y-3">
+            <h3 className="font-bold text-gray-800">Available Plans</h3>
+            <table className="w-full text-left text-sm">
+              <thead><tr><th className="py-2">Plan</th><th>Banks</th><th>Users</th></tr></thead>
+              <tbody>
+                <tr><td className="py-2">Trial ? 14 days</td><td>1</td><td>1</td></tr>
+                {Object.entries(PLAN_LIMITS).map(([name, limits]) => <tr key={name}>
+                  <td className="py-2">{name}</td><td>{formatLimit(limits.banks)}</td><td>{limits.users}</td>
+                </tr>)}
+              </tbody>
+            </table>
+          </section>
         </div>
       </div>
     </div>
